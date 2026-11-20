@@ -1,15 +1,30 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
+; ---------- ตั้งค่า (แก้ตรงนี้ได้) ----------
+OPACITY := 215          ; ความทึบ 0-255 (ยิ่งน้อยยิ่งโปร่ง)
+PEEK_MS := 4000         ; กด Ctrl+Alt+U แล้วโชว์กี่มิลลิวินาที
 W := 300, H := 156
 ini := A_AppData "\uptime_widget.ini"
+
 record := Integer(IniRead(ini, "stats", "record", "0"))   ; สถิติเปิดนานสุด (วินาที)
 sessionStart := 0                                          ; เวลาเริ่มเซสชัน (FILETIME)
 lastTier := -1
 colors := ["A6E3A1", "F9E2AF", "FAB387", "F38BA8"]         ; เขียว > เหลือง > ส้ม > แดง
 
-; ---------- หน้าต่าง (ไม่มีกรอบ ลอยบนสุด ไม่โชว์ในแถบงาน) ----------
-g := Gui("-Caption +AlwaysOnTop +ToolWindow", "เปิดคอมมานานแค่ไหน")
+userHidden := false     ; ผู้ใช้สั่งซ่อน
+alwaysTop := false      ; ค่าเริ่มต้น: ไม่ลอยบนสุด (อยู่ชั้นเดียวกับหน้าต่างทั่วไป)
+peeking := false           ; กำลังโชว์ชั่วคราว
+shown := false
+
+nPeek := "ดูเวลา (Ctrl+Alt+U)"
+nHide := "ซ่อนตัวจับเวลา"
+nTop := "ลอยบนสุดเสมอ"
+nClick := "คลิกทะลุ (เมาส์ไม่โดนตัวจับเวลา)"
+
+; ---------- หน้าต่าง ----------
+; +E0x08000000 = ไม่แย่งโฟกัส (คลิกที่ตัวจับเวลาแล้วเกมไม่หลุดโฟกัส)
+g := Gui("-Caption +ToolWindow +E0x08000000", "เปิดคอมมานานแค่ไหน")
 g.BackColor := "1E1E2E"
 g.MarginX := 0
 g.MarginY := 0
@@ -55,6 +70,8 @@ r := Round(18 * A_ScreenDPI / 96)
 WinSetRegion("0-0 w" gw " h" gh " r" r "-" r, g)
 WinMove(x, y, , , g)
 g.Show("NA")
+WinSetTransparent(OPACITY, g)
+shown := true
 
 ; ---------- ลากย้ายด้วยเมาส์ และจำตำแหน่ง ----------
 OnMessage(0x201, OnLButtonDown)
@@ -76,16 +93,101 @@ SaveRecord() {
     IniWrite(record, ini, "stats", "record")
 }
 
-; ---------- คลิกขวา: เมนู ----------
+; ---------- เมนู (คลิกขวาที่ตัวจับเวลา และที่ไอคอนถาดระบบ) ----------
+BuildMenu(mm) {
+    mm.Add(nPeek, Peek)
+    mm.Add(nHide, ToggleHide)
+    mm.Add(nTop, ToggleTop)
+    mm.Add(nClick, ToggleClickThrough)
+    mm.Add()
+    mm.Add("ปิดโปรแกรม", (*) => ExitApp())
+}
+
 m := Menu()
-m.Add("ลอยบนสุดเสมอ", ToggleTop)
-m.Check("ลอยบนสุดเสมอ")
-m.Add("ปิดโปรแกรม", (*) => ExitApp())
+BuildMenu(m)
+A_TrayMenu.Delete()
+BuildMenu(A_TrayMenu)
+A_TrayMenu.Default := nPeek
+A_TrayMenu.ClickCount := 1
+A_IconTip := "เปิดคอมมานานแค่ไหน"
+
 g.OnEvent("ContextMenu", (*) => m.Show())
+Hotkey("^!u", Peek)
+
+ToggleBoth(name) {
+    m.ToggleCheck(name)
+    A_TrayMenu.ToggleCheck(name)
+}
+
+ToggleHide(name, *) {
+    global userHidden
+    userHidden := !userHidden
+    ToggleBoth(name)
+    UpdateVisibility()
+}
 
 ToggleTop(name, *) {
-    WinSetAlwaysOnTop(-1, g)
-    m.ToggleCheck(name)
+    global alwaysTop
+    alwaysTop := !alwaysTop
+    WinSetAlwaysOnTop(alwaysTop ? 1 : 0, g)
+    ToggleBoth(name)
+}
+
+ToggleClickThrough(name, *) {
+    WinSetExStyle("^0x20", g)     ; WS_EX_TRANSPARENT
+    ToggleBoth(name)
+}
+
+; ---------- แวบขึ้นมาดูเวลาชั่วคราว ----------
+Peek(*) {
+    global peeking
+    peeking := true
+    WinSetAlwaysOnTop(1, g)
+    UpdateVisibility()
+    SetTimer(EndPeek, -PEEK_MS)
+}
+
+EndPeek() {
+    global peeking
+    peeking := false
+    WinSetAlwaysOnTop(alwaysTop ? 1 : 0, g)
+    UpdateVisibility()
+}
+
+; ---------- ซ่อนอัตโนมัติเมื่อมีโปรแกรมเต็มจอ (เกม / วิดีโอเต็มจอ) ----------
+IsFullscreenActive() {
+    hwnd := WinExist("A")
+    if (!hwnd || hwnd = g.Hwnd)
+        return false
+    try {
+        cls := WinGetClass(hwnd)
+        style := WinGetStyle(hwnd)
+        WinGetPos(&wx, &wy, &ww, &wh, hwnd)
+    } catch {
+        return false
+    }
+    if (cls = "Progman" || cls = "WorkerW" || cls = "Shell_TrayWnd" || cls = "Shell_SecondaryTrayWnd")
+        return false
+    if (style & 0xC00000)          ; มีแถบหัวหน้าต่าง = หน้าต่างปกติ ไม่ใช่เต็มจอ
+        return false
+    Loop MonitorGetCount() {
+        MonitorGet(A_Index, &ml, &mt, &mr, &mb)
+        if (wx <= ml && wy <= mt && wx + ww >= mr && wy + wh >= mb)
+            return true
+    }
+    return false
+}
+
+UpdateVisibility() {
+    global shown
+    want := peeking || (!userHidden && !IsFullscreenActive())
+    if (want && !shown) {
+        g.Show("NA")
+        shown := true
+    } else if (!want && shown) {
+        g.Hide()
+        shown := false
+    }
 }
 
 ; ---------- เวลาเริ่มเซสชัน ----------
@@ -136,17 +238,24 @@ Tick() {
     d := s // 86400
     hrs := s // 3600
 
+    if (Mod(s, 60) = 0 || s > record)
+        record := Max(record, s)
+    if (Mod(s, 60) = 0)
+        SaveRecord()
+
+    UpdateVisibility()
+    if !shown                       ; ซ่อนอยู่ ไม่ต้องอัปเดตหน้าจอ
+        return
+
     clock.Text := Format("{:02d}:{:02d}:{:02d}", Mod(hrs, 24), Mod(s // 60, 60), Mod(s, 60))
     daysTxt.Text := d ? d . " วัน" : ""
 
-    ; สีตัวเลขเปลี่ยนตามความนาน
     tier := hrs >= 8 ? 3 : hrs >= 4 ? 2 : hrs >= 2 ? 1 : 0
     if (tier != lastTier) {
         lastTier := tier
         clock.SetFont("s30 bold c" . colors[tier + 1], "Consolas")
     }
 
-    ; ข้อความให้กำลังใจ / เตือนพัก
     if (hrs >= 8)
         msg := "เกิน 8 ชั่วโมงแล้ว! ไปพักผ่อนบ้างนะ"
     else if (hrs >= 4)
@@ -160,14 +269,9 @@ Tick() {
     if (msgTxt.Text != msg)
         msgTxt.Text := msg
 
-    ; สถิติเปิดนานสุด
-    if (s > record)
-        record := s
     rec := (s >= record) ? "★ กำลังทำสถิติใหม่!" : "สถิติเปิดนานสุด: " . FormatDur(record)
     if (recTxt.Text != rec)
         recTxt.Text := rec
-    if (Mod(s, 60) = 0)
-        SaveRecord()
 }
 
 Tick()
